@@ -1,53 +1,32 @@
 // Waitlist API for gomagnet.ai. Express + Postgres on Render.
+// On Render PR previews (IS_PULL_REQUEST=true) the store auto-falls-back to in-memory
+// so previews can't touch prod data.
 import express from "express";
 import cors from "cors";
-import pkg from "pg";
 import { z } from "zod";
+import { makeStore, IS_PREVIEW, STORE_KIND } from "./store.js";
 
-const { Pool } = pkg;
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
-
-// ── DB ──────────────────────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("render.com") ? { rejectUnauthorized: false } : undefined,
-});
-
-async function migrate() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS waitlist (
-      id          SERIAL PRIMARY KEY,
-      email       TEXT NOT NULL,
-      source      TEXT,
-      ip          TEXT,
-      user_agent  TEXT,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT  waitlist_email_unique UNIQUE (email)
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS waitlist_created_idx ON waitlist (created_at DESC);`);
-  console.log("[migrate] schema ready");
-}
+const store = makeStore();
 
 // ── Middleware ──────────────────────────────────────────────
 const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "https://gomagnet.ai,https://www.gomagnet.ai").split(",").map((s) => s.trim());
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow same-origin (no Origin header) + listed origins + any *.onrender.com preview
       if (!origin) return cb(null, true);
       if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-      if (/\.onrender\.com$/.test(new URL(origin).hostname)) return cb(null, true);
+      try {
+        if (/\.onrender\.com$/.test(new URL(origin).hostname)) return cb(null, true);
+      } catch {}
       if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked: ${origin}`));
     },
   }),
 );
 app.use(express.json({ limit: "16kb" }));
-
-// Trust Render's proxy so req.ip reflects the real client.
 app.set("trust proxy", true);
 
 // ── Naive in-memory rate limit: 5 req / IP / minute ─────────
@@ -63,17 +42,17 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// ── Validation ──────────────────────────────────────────────
 const SignupSchema = z.object({
-  email:  z.string().email().max(254).transform((v) => v.trim().toLowerCase()),
+  email: z.string().email().max(254).transform((v) => v.trim().toLowerCase()),
+  name: z.string().min(1).max(120).optional().transform((v) => v?.trim() || undefined),
   source: z.string().max(64).optional(),
 });
 
 // ── Routes ──────────────────────────────────────────────────
 app.get("/api/health", async (_req, res) => {
   try {
-    const { rows } = await pool.query("SELECT 1 AS ok");
-    res.json({ ok: true, db: rows[0].ok === 1 });
+    const h = await store.health();
+    res.json({ ok: true, ...h, mode: IS_PREVIEW ? "preview" : "prod" });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -82,34 +61,30 @@ app.get("/api/health", async (_req, res) => {
 app.post("/api/waitlist", rateLimit, async (req, res) => {
   const parsed = SignupSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid email" });
-  const { email, source } = parsed.data;
+  const { email, name, source } = parsed.data;
   const ua = (req.headers["user-agent"] || "").toString().slice(0, 500);
   const ip = req.ip || null;
   try {
-    const { rows } = await pool.query(
-      `INSERT INTO waitlist (email, source, ip, user_agent)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-       RETURNING id, email, created_at`,
-      [email, source ?? null, ip, ua],
-    );
-    res.json({ ok: true, message: "You're on the list!", id: rows[0].id });
+    const { id, isNew } = await store.addSignup({ email, name, source, ip, userAgent: ua });
+    res.json({
+      ok: true,
+      message: isNew ? "You're on the list!" : "You're already on the list.",
+      id,
+      preview: IS_PREVIEW || undefined,
+    });
   } catch (e) {
     console.error("[waitlist] insert failed", e);
     res.status(500).json({ error: "Could not save signup. Please try again." });
   }
 });
 
-// Admin: list signups. Simple bearer token from env.
 app.get("/api/waitlist", async (req, res) => {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
-    const { rows } = await pool.query(
-      `SELECT id, email, source, created_at FROM waitlist ORDER BY created_at DESC LIMIT 1000`,
-    );
-    res.json({ count: rows.length, signups: rows });
+    const signups = await store.listSignups(1000);
+    res.json({ count: signups.length, signups, mode: IS_PREVIEW ? "preview" : "prod" });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -117,8 +92,8 @@ app.get("/api/waitlist", async (req, res) => {
 
 app.get("/api/waitlist/count", async (_req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT COUNT(*)::int AS count FROM waitlist`);
-    res.json({ count: rows[0].count });
+    const count = await store.count();
+    res.json({ count, mode: IS_PREVIEW ? "preview" : "prod" });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -126,11 +101,8 @@ app.get("/api/waitlist/count", async (_req, res) => {
 
 // ── Boot ────────────────────────────────────────────────────
 (async () => {
-  if (process.env.DATABASE_URL) {
-    try { await migrate(); }
-    catch (e) { console.error("[migrate] failed", e); process.exit(1); }
-  } else {
-    console.warn("[boot] DATABASE_URL not set — running without DB; calls will fail");
-  }
+  console.log(`[boot] store: ${STORE_KIND}`);
+  try { await store.init(); console.log("[boot] store ready"); }
+  catch (e) { console.error("[boot] store init failed", e); process.exit(1); }
   app.listen(PORT, () => console.log(`[boot] waitlist api listening on :${PORT}`));
 })();

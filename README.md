@@ -7,7 +7,7 @@ Waitlist signup API + Postgres for **gomagnet.ai**. Express 5 + node-postgres on
 | Method | Path                  | Purpose                                            | Auth         |
 |--------|-----------------------|----------------------------------------------------|--------------|
 | GET    | `/api/health`         | Health check (DB ping)                             | none         |
-| POST   | `/api/waitlist`       | Add an email. Body: `{ "email": "...", "source": "..." }` | none, rate-limited |
+| POST   | `/api/waitlist`       | Add a signup. Body: `{ "email": "...", "name": "...", "source": "..." }` (name + source optional) | none, rate-limited |
 | GET    | `/api/waitlist`       | List signups (latest 1000)                         | `Bearer ADMIN_TOKEN` |
 | GET    | `/api/waitlist/count` | Public total count                                 | none         |
 
@@ -34,13 +34,14 @@ Connect this repo as a Render Blueprint and both services come up together.
 CREATE TABLE waitlist (
   id          SERIAL PRIMARY KEY,
   email       TEXT NOT NULL UNIQUE,
+  name        TEXT,
   source      TEXT,
   ip          TEXT,
   user_agent  TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
-Auto-migrated on boot.
+Auto-migrated on boot. Idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS name` runs against pre-existing tables.
 
 ## Reading signups
 
