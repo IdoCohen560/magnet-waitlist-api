@@ -2,7 +2,6 @@
 // On Render PR previews (IS_PULL_REQUEST=true) the store auto-falls-back to in-memory
 // so previews can't touch prod data.
 import express from "express";
-import cors from "cors";
 import { z } from "zod";
 import { makeStore, IS_PREVIEW, STORE_KIND } from "./store.js";
 
@@ -10,24 +9,38 @@ const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const store = makeStore();
-
-// ── Middleware ──────────────────────────────────────────────
-const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "https://gomagnet.ai,https://www.gomagnet.ai").split(",").map((s) => s.trim());
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-      try {
-        if (/\.onrender\.com$/.test(new URL(origin).hostname)) return cb(null, true);
-      } catch {}
-      if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked: ${origin}`));
-    },
-  }),
-);
-app.use(express.json({ limit: "16kb" }));
 app.set("trust proxy", true);
+
+// ── CORS — hand-rolled so Express 5 handles preflight on all paths ──
+const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "https://gomagnet.ai,https://www.gomagnet.ai")
+  .split(",")
+  .map((s) => s.trim());
+
+function isAllowed(origin) {
+  if (!origin) return false;
+  if (ALLOW_ORIGINS.includes(origin)) return true;
+  try {
+    const host = new URL(origin).hostname;
+    if (/\.onrender\.com$/.test(host)) return true;
+    if (/^localhost$/.test(host)) return true;
+  } catch {}
+  return false;
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isAllowed(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+app.use(express.json({ limit: "16kb" }));
 
 // ── Naive in-memory rate limit: 5 req / IP / minute ─────────
 const buckets = new Map();
